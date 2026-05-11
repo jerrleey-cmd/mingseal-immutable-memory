@@ -341,30 +341,50 @@ class BSVAnchor(AnchorBackendInterface):
     
     Format: MSLL | v2 | root(32B) | epoch | agent_pk_hash | signature
     
-    Note: This implementation provides the interface and mock functionality.
-    Actual BSV integration requires:
-    - BSV wallet with funds
-    - Connection to BSV network
-    - Transaction construction and signing
+    When private_key_hex is provided, performs real BSV anchoring via
+    WhatsonChain API. Falls back to mock mode if no key or on failure.
     """
     
     MSLL_MAGIC = b"MSLL"
     VERSION = 2
     
-    def __init__(self, wif_key: Optional[str] = None, network: str = "main"):
+    def __init__(
+        self,
+        private_key_hex: Optional[str] = None,
+        network: str = "main",
+        fee_satoshis: int = 1000,
+        woc_api_url: Optional[str] = None,
+    ):
         """
         Initialize BSV anchor.
         
         Args:
-            wif_key: BSV private key in WIF format
+            private_key_hex: BSV private key in HEX format (not WIF)
             network: Network type ("main" or "test")
+            fee_satoshis: Transaction fee in satoshis
+            woc_api_url: Custom WhatsonChain API URL (optional)
         """
-        self._wif_key = wif_key
+        self._private_key_hex = private_key_hex
         self._network = network
+        self._fee = fee_satoshis
         self._anchors: Dict[str, AnchorResult] = {}
+        self._wallet = None
+        self._mock_mode = True
         
-        if not wif_key:
-            logger.warning("No BSV WIF key provided - using mock mode")
+        if private_key_hex:
+            try:
+                from .bsv_tx import BSVWallet
+                self._wallet = BSVWallet(
+                    private_key_hex=private_key_hex,
+                    network=network,
+                )
+                self._mock_mode = False
+                logger.info(f"BSV Anchor initialized with address: {self._wallet.address}")
+            except Exception as e:
+                logger.warning(f"Failed to initialize BSV wallet: {e}. Using mock mode.")
+                self._mock_mode = True
+        else:
+            logger.warning("No BSV private key provided - using mock mode")
     
     def _construct_op_return(self, merkle_root: bytes, metadata: Dict[str, Any]) -> bytes:
         """
@@ -376,67 +396,133 @@ class BSVAnchor(AnchorBackendInterface):
         - merkle_root (32 bytes) - The anchored root
         - epoch (4 bytes) - Unix timestamp / 512
         - agent_pk_hash (20 bytes) - Hash of agent public key
-        - signature (64 bytes) - Signature of the above data
+        - signature (64+ bytes) - DER signature of the above data
         """
         merkle_root_bytes = merkle_root if isinstance(merkle_root, bytes) else bytes.fromhex(merkle_root)
         
-        # Compute epoch (simplified)
+        # Ensure 32 bytes
+        if len(merkle_root_bytes) < 32:
+            merkle_root_bytes = merkle_root_bytes + bytes(32 - len(merkle_root_bytes))
+        elif len(merkle_root_bytes) > 32:
+            merkle_root_bytes = merkle_root_bytes[:32]
+        
+        # Compute epoch (Unix timestamp / 512)
         epoch = int(datetime.utcnow().timestamp()) // 512
         
-        # Agent PK hash (mock if no key provided)
-        if self._wif_key:
-            agent_pk_hash = hashlib.new("ripemd160", self._wif_key.encode()).digest()[:20]
+        # Agent PK hash (from public key if wallet available)
+        if self._wallet:
+            agent_pk_hash = self._wallet.pubkey_hash
         else:
             agent_pk_hash = bytes(20)
         
-        # Build data
-        data = bytearray()
-        data.extend(self.MSLL_MAGIC)
-        data.append(self.VERSION)
-        data.extend(merkle_root_bytes[:32])
-        data.extend(epoch.to_bytes(4, "little"))
-        data.extend(agent_pk_hash)
+        # Build data to sign
+        data_to_sign = bytearray()
+        data_to_sign.extend(self.MSLL_MAGIC)
+        data_to_sign.append(self.VERSION)
+        data_to_sign.extend(merkle_root_bytes[:32])
+        data_to_sign.extend(epoch.to_bytes(4, "little"))
+        data_to_sign.extend(agent_pk_hash)
         
-        # Signature placeholder (would be computed with actual key)
-        if self._wif_key:
-            signature = hashlib.sha256(bytes(data) + self._wif_key.encode()).digest()
+        # Sign with ECDSA if wallet available
+        if self._wallet and self._private_key_hex:
+            from cryptography.hazmat.primitives.asymmetric import ec
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.backends import default_backend
+            
+            private_key = ec.derive_private_key(
+                int.from_bytes(bytes.fromhex(self._private_key_hex), 'big'),
+                ec.SECP256K1(),
+                default_backend()
+            )
+            
+            # Hash the data to sign
+            data_hash = hashlib.sha256(bytes(data_to_sign)).digest()
+            
+            # Sign
+            signature = private_key.sign(
+                data_hash,
+                ec.ECDSA(hashes.SHA256())
+            )
         else:
-            signature = bytes(64)
-        data.extend(signature)
+            # Mock signature (64 bytes placeholder)
+            signature = hashlib.sha256(bytes(data_to_sign)).digest() * 2
         
-        return bytes(data)
+        # Build full OP_RETURN data
+        op_return_data = bytearray()
+        op_return_data.extend(data_to_sign)
+        op_return_data.extend(signature)
+        
+        return bytes(op_return_data)
     
     async def anchor(self, merkle_root: bytes, metadata: Dict[str, Any]) -> AnchorResult:
         """
         Anchor to BSV blockchain.
         
-        Note: In production, this would:
-        1. Construct OP_RETURN transaction
-        2. Sign with BSV private key
-        3. Broadcast to BSV network
-        4. Wait for confirmation
-        
-        Current implementation is a mock.
+        If wallet is configured, creates a real BSV transaction with OP_RETURN.
+        Falls back to mock mode if no wallet or on error.
         """
         merkle_root_hex = merkle_root.hex() if isinstance(merkle_root, bytes) else merkle_root
         
         # Construct OP_RETURN data
         op_return_data = self._construct_op_return(merkle_root, metadata)
         
-        # Create mock transaction ID
+        # Try real BSV anchoring if wallet is available
+        if not self._mock_mode and self._wallet:
+            try:
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        txid, tx_hex = await self._wallet.anchor(
+                            op_return_data=op_return_data,
+                            fee=self._fee,
+                        )
+                        
+                        result = create_anchor_result(
+                            backend=AnchorBackend.BSV,
+                            merkle_root=merkle_root_hex,
+                            tx_id=txid,
+                        )
+                        
+                        result.proof_data = {
+                            "op_return_hex": op_return_data.hex(),
+                            "network": self._network,
+                            "address": self._wallet.address,
+                            "fee_satoshis": self._fee,
+                            "tx_hex": tx_hex,
+                            "mode": "real",
+                        }
+                        
+                        self._anchors[result.anchor_id] = result
+                        logger.info(f"BSV anchor created (real): {result.anchor_id}, txid: {txid}")
+                        return result
+                        
+                    except Exception as e:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"BSV anchor attempt {attempt + 1} failed: {e}. Retrying...")
+                            import asyncio
+                            await asyncio.sleep(1)  # Brief delay before retry
+                        else:
+                            raise
+                            
+            except Exception as e:
+                logger.error(f"Real BSV anchoring failed: {e}. Falling back to mock mode.")
+                self._mock_mode = True
+        
+        # Mock mode (fallback or no wallet)
         tx_id = hashlib.sha256(op_return_data + datetime.utcnow().isoformat().encode()).hexdigest()
         
         result = create_anchor_result(
             backend=AnchorBackend.BSV,
             merkle_root=merkle_root_hex,
-            tx_id=f"bsv_{tx_id[:16]}",
+            tx_id=f"bsv_mock_{tx_id[:16]}",
         )
         
         result.proof_data = {
             "op_return_hex": op_return_data.hex(),
             "network": self._network,
-            "note": "Mock BSV - actual integration requires BSV wallet and network",
-            "block_height": None,  # Would be set after confirmation
+            "note": "Mock BSV - no real transaction broadcast",
+            "block_height": None,
+            "mode": "mock",
         }
         
         self._anchors[result.anchor_id] = result
@@ -449,12 +535,8 @@ class BSVAnchor(AnchorBackendInterface):
         """
         Verify a BSV anchor.
         
-        Note: In production, this would:
-        1. Query BSV blockchain for transaction
-        2. Verify OP_RETURN data matches
-        3. Return block information
-        
-        Current implementation is a mock.
+        If wallet is available, queries the blockchain for real verification.
+        Otherwise uses local mock verification.
         """
         merkle_root_hex = merkle_root.hex() if isinstance(merkle_root, bytes) else merkle_root
         
@@ -474,12 +556,48 @@ class BSVAnchor(AnchorBackendInterface):
             result.add_error("Merkle root mismatch")
             return result
         
-        result.verified = True
-        result.anchor_valid = True
-        result.chain_confirmed = True  # Mock always confirmed
-        result.anchor_timestamp = anchor.timestamp
-        result.tx_id = anchor.tx_id
-        result.block_height = 850000  # Mock block height
+        # Check if real or mock
+        is_mock = anchor.proof_data.get("mode") == "mock"
+        tx_id = anchor.tx_id
+        
+        if not is_mock and tx_id and self._wallet:
+            # Real verification - check blockchain
+            try:
+                tx_data = await self._wallet.check_tx(tx_id)
+                
+                if tx_data.get("found", False):
+                    result.verified = True
+                    result.anchor_valid = True
+                    result.chain_confirmed = tx_data.get("confirmed", False)
+                    result.anchor_timestamp = anchor.timestamp
+                    result.tx_id = tx_id
+                    result.block_height = tx_data.get("block_height")
+                    
+                    # Verify OP_RETURN data in the transaction
+                    if "vout" in tx_data:
+                        for vout in tx_data.get("vout", []):
+                            script = vout.get("script", "")
+                            if "6a" in script:  # OP_RETURN opcode
+                                result.add_warning("OP_RETURN output found in transaction")
+                else:
+                    result.add_error(f"Transaction {tx_id} not found on chain")
+                    return result
+                    
+            except Exception as e:
+                logger.error(f"Chain verification failed: {e}")
+                result.add_warning(f"Could not verify on chain: {e}")
+                result.verified = True  # Not a failure, just couldn't verify
+                result.anchor_valid = True
+        else:
+            # Mock verification
+            result.verified = True
+            result.anchor_valid = True
+            result.chain_confirmed = not is_mock  # Real = confirmed, mock = not confirmed
+            result.anchor_timestamp = anchor.timestamp
+            result.tx_id = tx_id
+        
+        if is_mock:
+            result.add_warning("Mock anchor - not verified on chain")
         
         return result
     

@@ -102,9 +102,11 @@ class MemoryServer:
         elif backend_type == AnchorBackendType.OTS:
             self._anchor = OpenTimestampsAnchor(config.anchoring.ots_calendar_urls)
         elif backend_type == AnchorBackendType.BSV:
+            bsv_key = config.anchoring.bsv_private_key_hex or os.environ.get("MINGSEAL_BSV_PRIVATE_KEY")
             self._anchor = BSVAnchor(
-                wif_key=config.anchoring.bsv_wif_key,
+                private_key_hex=bsv_key,
                 network=config.anchoring.bsv_network,
+                fee_satoshis=config.anchoring.bsv_fee_satoshis,
             )
         else:
             self._anchor = LocalSignAnchor()

@@ -28,8 +28,9 @@ class AnchoringConfig:
     """Configuration for the anchoring backend."""
     backend: AnchorBackendType = AnchorBackendType.LOCAL
     # BSV-specific settings
-    bsv_wif_key: Optional[str] = None
+    bsv_private_key_hex: Optional[str] = None  # HEX format private key
     bsv_network: str = "main"  # "main" or "test"
+    bsv_fee_satoshis: int = 1000
     # OTS-specific settings
     ots_calendar_urls: list[str] = field(default_factory=lambda: [
         "https://www.ots.cdf.ericsson.net"
@@ -128,8 +129,9 @@ class ConfigManager:
                 anchoring_data = data.get("anchoring", {})
                 anchoring = AnchoringConfig(
                     backend=AnchorBackendType(anchoring_data.get("backend", "local")),
-                    bsv_wif_key=anchoring_data.get("bsv_wif_key"),
+                    bsv_private_key_hex=anchoring_data.get("bsv_private_key_hex"),
                     bsv_network=anchoring_data.get("bsv_network", "main"),
+                    bsv_fee_satoshis=anchoring_data.get("bsv_fee_satoshis", 1000),
                     ots_calendar_urls=anchoring_data.get(
                         "ots_calendar_urls",
                         ["https://www.ots.cdf.ericsson.net"]
@@ -175,8 +177,9 @@ class ConfigManager:
         data = {
             "anchoring": {
                 "backend": config.anchoring.backend.value,
-                "bsv_wif_key": config.anchoring.bsv_wif_key,
+                "bsv_private_key_hex": config.anchoring.bsv_private_key_hex,
                 "bsv_network": config.anchoring.bsv_network,
+                "bsv_fee_satoshis": config.anchoring.bsv_fee_satoshis,
                 "ots_calendar_urls": config.anchoring.ots_calendar_urls,
             },
             "database": {

@@ -13,6 +13,13 @@ from .anchor import (
     BSVAnchor,
     get_anchor_backend,
 )
+from .bsv_tx import (
+    BSVTransaction,
+    BSVWallet,
+    build_and_sign_op_return_tx,
+    double_sha256,
+    hash160,
+)
 from .verification import VerificationEngine, VerificationStatus
 from .state_root import compute_state_root, StateSnapshot, create_state_snapshot, MemoryFileHash
 
@@ -33,6 +40,11 @@ __all__ = [
     "OpenTimestampsAnchor",
     "BSVAnchor",
     "get_anchor_backend",
+    "BSVTransaction",
+    "BSVWallet",
+    "build_and_sign_op_return_tx",
+    "double_sha256",
+    "hash160",
     "VerificationEngine",
     "VerificationStatus",
     "compute_state_root",

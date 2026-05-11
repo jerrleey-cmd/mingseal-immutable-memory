@@ -125,12 +125,17 @@ class TestBSVAnchor:
     
     @pytest.fixture
     def anchor(self):
-        """Create a BSVAnchor instance."""
+        """Create a BSVAnchor instance (mock mode - no key)."""
         return BSVAnchor(network="test")
     
+    @pytest.fixture
+    def mock_anchor(self):
+        """Create a BSVAnchor with explicit mock mode."""
+        return BSVAnchor(private_key_hex=None, network="test")
+    
     @pytest.mark.asyncio
-    async def test_anchor(self, anchor):
-        """Test BSV anchoring (mock)."""
+    async def test_anchor_mock_mode(self, anchor):
+        """Test BSV anchoring in mock mode (no wallet)."""
         merkle_root = b"test_merkle_root_32_bytes_data_"
         
         result = await anchor.anchor(merkle_root, {})
@@ -138,18 +143,56 @@ class TestBSVAnchor:
         assert result.anchor_id is not None
         assert result.backend == AnchorBackend.BSV
         assert "op_return_hex" in result.proof_data
+        assert result.proof_data.get("mode") == "mock"
     
     @pytest.mark.asyncio
-    async def test_verify(self, anchor):
-        """Test verifying BSV anchor (mock)."""
+    async def test_anchor_op_return_format(self, anchor):
+        """Test that OP_RETURN data has correct MSLL format."""
+        # Use a 32-byte merkle root (properly padded if needed)
+        merkle_root = b"test_merkle_root_32_bytes_da"  # 31 bytes, will be padded to 32
+        
+        result = await anchor.anchor(merkle_root, {})
+        
+        op_return_hex = result.proof_data.get("op_return_hex", "")
+        op_return_bytes = bytes.fromhex(op_return_hex)
+        
+        # Check total minimum length (4 + 1 + 32 + 4 + 20 + 64 = 125)
+        assert len(op_return_bytes) >= 125, f"OP_RETURN data too short: {len(op_return_bytes)} bytes"
+        
+        # Check MSLL magic
+        assert op_return_bytes[:4] == b"MSLL", "Missing MSLL magic bytes"
+        # Check version
+        assert op_return_bytes[4] == 2, "Wrong version byte"
+        # Check epoch (4 bytes after merkle_root starts at byte 37)
+        epoch = int.from_bytes(op_return_bytes[37:41], "little")
+        assert epoch > 0, "Invalid epoch"
+        # Check agent_pk_hash (20 bytes after epoch)
+        assert len(op_return_bytes[41:61]) == 20, "Invalid agent_pk_hash length"
+        # Check signature exists (rest)
+        assert len(op_return_bytes[61:]) > 0, "Missing signature"
+    
+    @pytest.mark.asyncio
+    async def test_verify_mock(self, anchor):
+        """Test verifying BSV anchor (mock mode)."""
         merkle_root = b"test_merkle_root_32_bytes_data_"
         
         result = await anchor.anchor(merkle_root, {})
         verify_result = await anchor.verify(merkle_root, result.anchor_id)
         
-        # Mock BSV anchor should be verified
+        # Mock BSV anchor should be verified with warning
         assert verify_result.verified is True
         assert verify_result.anchor_valid is True
+        assert any("Mock" in w for w in verify_result.warnings), "Expected mock warning"
+    
+    @pytest.mark.asyncio
+    async def test_verify_nonexistent(self, anchor):
+        """Test verification of nonexistent anchor."""
+        merkle_root = b"test_merkle_root_32_bytes_data_"
+        
+        verify_result = await anchor.verify(merkle_root, "nonexistent_id")
+        
+        assert verify_result.verified is False
+        assert len(verify_result.errors) > 0
     
     def test_capability(self, anchor):
         """Test getting backend capabilities."""
